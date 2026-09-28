@@ -1,7 +1,5 @@
 """Filtros por metadados + busca hibrida para o MTG Semantic Searcher.
 
-*(Feito com ClaudeAI)*
-
 Ideia: separar a consulta em duas partes.
   1. FILTROS (tipo, cor, custo)  -> codigo comum, garantido, sem ambiguidade.
   2. SIGNIFICADO (o resto)       -> embedding, que ordena as cartas que passaram.
@@ -775,14 +773,18 @@ def _z(x):
 
 
 def hybrid_search(query, model, embeddings, cards, query_prefix, k=10, verbose=True, parser=parse_query,
-                  embed_full_query=True):
+                  embed_full_query=True, alpha_if_no_semantic=False):
     """cards: lista de dicts ALINHADA com as linhas de `embeddings` (mesma ordem).
     Com "cheap"/"expensive" na consulta, o campo 'score' vira uma nota combinada
     (relevancia + custo); a similaridade pura fica em 'sim'.
     Consulta so de filtros + cheap/expensive (ex.: "cheap green creature"): nao ha relevancia
     a preservar, entao ordena direto por custo (desempate pela similaridade).
     embed_full_query=True (padrao): embeda a consulta INTEIRA, mesmo depois de tirar os filtros;
-    False: embeda so o texto que sobrou (ex.: 'destroys artifacts')."""
+    False: embeda so o texto que sobrou (ex.: 'destroys artifacts').
+    alpha_if_no_semantic=False (padrao): se True e a consulta for SO filtro (nada sobrou de
+    texto semantico e sem preferencia cheap/expensive), pula o modelo de embedding de vez e
+    devolve os resultados em ordem alfabetica pelo nome -- nao ha "relevancia" a calcular
+    quando a consulta inteira ja virou filtro exato (caso tipico do parse_query_syntax)."""
     filters, semantic = parser(query)
     mask = np.array([matches(c, filters) for c in cards])
     if filters.get("cost_pref"):                    # "cheap"/"expensive" so faz sentido para cartas com custo
@@ -800,6 +802,17 @@ def hybrid_search(query, model, embeddings, cards, query_prefix, k=10, verbose=T
     if filters.get("name") and not semantic and not filters.get("cost_pref"):
         pool = np.flatnonzero(mask)
         order = sorted(pool, key=lambda i: _name_rank(cards[i], filters["name"]))[:k]
+        return [{"score": None, "sim": None, "cmc": card_cmc(cards[i]),
+                 "name": cards[i]["name"], "type_line": cards[i].get("type_line"),
+                 "mana_cost": cards[i].get("mana_cost"), "oracle_text": cards[i].get("oracle_text")}
+                for i in order]
+
+    # Consulta SO de filtro, sem nenhum texto semantico pra ranquear (ex.: "t:dinosaur c:g"
+    # no parse_query_syntax): nao ha relevancia nenhuma a calcular, entao nem chama o modelo
+    # de embedding -- devolve tudo que passou no filtro, em ordem alfabetica pelo nome.
+    if alpha_if_no_semantic and not semantic and not filters.get("cost_pref"):
+        pool = np.flatnonzero(mask)
+        order = sorted(pool, key=lambda i: (cards[i].get("name") or "").lower())[:k]
         return [{"score": None, "sim": None, "cmc": card_cmc(cards[i]),
                  "name": cards[i]["name"], "type_line": cards[i].get("type_line"),
                  "mana_cost": cards[i].get("mana_cost"), "oracle_text": cards[i].get("oracle_text")}
