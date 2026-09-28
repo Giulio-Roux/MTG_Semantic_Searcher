@@ -1,5 +1,7 @@
 """Filtros por metadados + busca hibrida para o MTG Semantic Searcher.
 
+*(Feito com ClaudeAI)*
+
 Ideia: separar a consulta em duas partes.
   1. FILTROS (tipo, cor, custo)  -> codigo comum, garantido, sem ambiguidade.
   2. SIGNIFICADO (o resto)       -> embedding, que ordena as cartas que passaram.
@@ -8,6 +10,8 @@ Regra para nao confundir assunto com alvo:
   so as palavras da FRASE NOMINAL INICIAL viram filtro.
   "creature that destroys artifacts"  -> filtro: Creature   | semantico: "destroys artifacts"
   "destroy target creature"           -> sem filtro         | semantico: a frase inteira
+  (essa mesma regra vale para subtipos: "dinosaur that costs 7 mana" -> filtro: dinosaur;
+   "destroy all dinosaurs" -> sem filtro, pois "dinosaurs" aqui e' o ALVO, nao a propria carta)
 """
 import difflib
 import json
@@ -89,9 +93,54 @@ def set_tag_index(cards):
     return idx
 
 
+# =====================================================================================
+# NOVO: indice dinamico de SUPERTIPOS/TIPOS/SUBTIPOS (Legendary, Aura, Dinosaur, Equipment,
+# Rabbit, Vehicle, Saga, Desert, ...), no mesmo espirito de _KEYWORD_INDEX / _TAG_INDEX acima:
+# construido a partir do proprio type_line dos cards, e nao de uma lista digitada a mao.
+# Isso resolve o "nem sempre vai estar escrito Dinosaur": em vez de eu ter que adivinhar/listar
+# cada subtipo que existe em Magic, o indice e' extraido dos dados reais, entao cobre
+# automaticamente qualquer subtipo que exista no seu corpus, com o nome exatamente como o
+# Scryfall escreve (so a CHAVE do dicionario e' minuscula, pra comparar sem depender de
+# maiuscula/minuscula; o VALOR guarda a grafia original, caso um dia voce queira exibir/usar).
+#
+# type_line vem tipicamente como "Legendary Enchantment — Aura" ou "Creature — Dinosaur Warrior":
+# a extracao so tira o travessao (em-dash "—", e tambem " - " por seguranca, caso seu dataset
+# use hifen simples) e pega cada palavra que sobra, dos dois lados do travessao.
+# =====================================================================================
+_TYPE_LINE_SPLIT = re.compile(r"\s*(?:—|--|-)\s*")   # em-dash "—", "--" ou " - " entre tipo e subtipo
+_TYPE_INDEX = {}
+
+
+def set_type_index(cards):
+    """Chame uma vez, depois de carregar `cards`, para habilitar o reconhecimento de
+    supertipos/subtipos que NAO estao na lista fixa TYPE_WORDS (ex.: 'dinosaur', 'aura',
+    'equipment', 'vehicle', 'rabbit', 'saga', 'legendary'...). Nao troca nada do que ja existe:
+    TYPE_WORDS continua sendo checado primeiro; isso so cobre o que TYPE_WORDS nao cobre.
+    Sem chamar isso, so os tipos principais de TYPE_WORDS continuam sendo reconhecidos
+    (nao quebra nada do comportamento atual)."""
+    global _TYPE_INDEX
+    idx = {}
+    for c in cards:
+        type_line = c.get("type_line") or ""
+        for metade in _TYPE_LINE_SPLIT.split(type_line):
+            for palavra in metade.split():
+                limpa = re.sub(r"[^\w]", "", palavra)
+                if limpa:
+                    idx.setdefault(limpa.lower(), limpa)
+    _TYPE_INDEX = idx
+    return idx
+
+
 def set_metadata_indexes(cards):
-    """Atalho: chama set_keyword_index e set_tag_index de uma vez."""
+    """Atalho: chama set_keyword_index e set_tag_index de una vez."""
     return set_keyword_index(cards), set_tag_index(cards)
+
+
+def set_all_indexes(cards):
+    """NOVO atalho equivalente a set_metadata_indexes, mas tambem chamando set_type_index.
+    Use este no lugar de set_metadata_indexes se quiser habilitar o filtro por
+    subtipo/supertipo (aura, dinosaur, equipment...) junto com keywords e tags."""
+    return set_keyword_index(cards), set_tag_index(cards), set_type_index(cards)
 
 
 def _phrases_by_length(index):
@@ -124,6 +173,19 @@ def _extract_keywords(text):
 
 def _extract_tags(text):
     return _extract_phrases(text, _TAG_INDEX)
+
+
+def _type_index_lookup(word):
+    """NOVO: procura `word` (ja' minuscula/sem pontuacao) no indice dinamico de tipos/subtipos.
+    Tenta a palavra exata e, se nao achar, a forma singular removendo um 's' final
+    ("dinosaurs" -> "dinosaur"), ja' que na consulta a palavra pode vir no plural mesmo
+    que no type_line ela sempre apareca no singular. Devolve o nome canonico (com a grafia
+    do Scryfall) ou None."""
+    if word in _TYPE_INDEX:
+        return _TYPE_INDEX[word]
+    if word.endswith("s") and word[:-1] in _TYPE_INDEX:
+        return _TYPE_INDEX[word[:-1]]
+    return None
 
 
 # ---------------------------------------------------------- interpretar a consulta
@@ -204,6 +266,17 @@ def parse_query(query: str):
         elif w in TYPE_WORDS:
             if TYPE_WORDS[w] not in filters["types"]:
                 filters["types"].append(TYPE_WORDS[w])
+            consumed += 1
+            recognized = True
+        # NOVO: subtipos/supertipos dinamicos (aura, dinosaur, equipment, rabbit, saga, ...).
+        # Fica DEPOIS do "elif w in TYPE_WORDS" de proposito: os tipos principais continuam
+        # sendo resolvidos pelo dicionario fixo (com plural ja mapeado); isso so entra em
+        # jogo pra palavras que TYPE_WORDS nao conhece. Guardado em minuscula, porque
+        # `matches()` compara com o type_line ja' com .lower() aplicado.
+        elif _type_index_lookup(w) is not None:
+            canonico = _type_index_lookup(w).lower()
+            if canonico not in filters["types"]:
+                filters["types"].append(canonico)
             consumed += 1
             recognized = True
         elif w in COLOR_WORDS:
@@ -299,13 +372,25 @@ def _name_parts(card: dict):
     return parts
 
 
+def _oracle_text_full(card: dict) -> str:
+    """oracle_text da carta; se vier vazio mas houver faces (dupla face), junta o texto de
+    cada face -- algumas cartas de dupla face nao tem oracle_text no nivel principal."""
+    text = card.get("oracle_text")
+    if not text and card.get("faces"):
+        text = " // ".join(fc.get("oracle_text") or "" for fc in card["faces"])
+    return text or ""
+
+
 def matches(card: dict, f: dict) -> bool:
     if f.get("name"):
         target = f["name"].lower()
         if not any(target in p.lower() for p in _name_parts(card)):
             return False
     type_line = (card.get("type_line") or "").lower()
-    if any(t not in type_line for t in f["types"]):
+    # match por PALAVRA inteira (nao substring): substring deixaria "t:land" bater em
+    # "Island" so' porque "land" aparece dentro de "Island" como sequencia de letras.
+    type_words = set(re.findall(r"[a-z]+", type_line))
+    if any(t not in type_words for t in f["types"]):
         return False
     colors = card_colors(card)
     if f["colorless"] and colors:
@@ -326,6 +411,10 @@ def matches(card: dict, f: dict) -> bool:
             return False
     if f.get("tags"):
         if not set(f["tags"]).issubset(set(card.get(TAG_FIELD) or [])):
+            return False
+    if f.get("oracle_words"):
+        text_words = set(re.findall(r"[a-z']+", _oracle_text_full(card).lower()))
+        if not set(f["oracle_words"]).issubset(text_words):
             return False
     for stat in ("power", "toughness", "loyalty", "defense"):
         lo, hi = f.get(f"{stat}_min"), f.get(f"{stat}_max")
@@ -353,12 +442,25 @@ Return ONLY valid JSON, no markdown fences, with exactly these keys:
  "keywords": [...], "produced_mana": [...], "tags": [...], "name": null, "semantic": "..."}
 
 Rules:
-- "types": card types the CARD ITSELF must have and has EXPLICITLY said (creature, instant, sorcery, artifact,
-  enchantment, land, planeswalker, battle, legendary). A type that is only the TARGET of the
-  card's effect does NOT go in "types". Include a type ONLY if that exact type word (creature/instant/sorcery/...) appears
-  literally in the query. Do NOT infer it from a functional tag ("removal" does not imply
-  instant/sorcery) or from a creature SUBTYPE ("dinosaur", "zombie", "angel" do not imply 
-  "creature" — subtype filtering isn't implemented yet, so leave such words in "semantic")
+- "types": card types AND subtypes/supertypes that the CARD ITSELF has and that the query
+  EXPLICITLY names. This includes: main types (creature, instant, sorcery, artifact, enchantment,
+  land, planeswalker, battle), supertypes (legendary, basic, snow, world), and any subtype
+  (creature types such as dinosaur/zombie/angel/rabbit/vampire; artifact subtypes such as
+  equipment/vehicle/food/clue; enchantment subtypes such as aura/saga/class; land subtypes such
+  as desert/cave/gate; and so on for any other permanent type). A type or subtype that is only the
+  TARGET of the card's effect does NOT go in "types" -- follow the exact same self-vs-target logic
+  for subtypes as for main types: "dinosaur that costs 7 mana" -> types includes "dinosaur"
+  (the card itself is a dinosaur); "destroy all dinosaurs" -> types stays empty and "dinosaurs"
+  stays in "semantic" (here the dinosaurs are what the card affects, not what it is).
+  Include a type/subtype ONLY if that exact word (or its plain singular form) appears literally in
+  the query. Do NOT infer a main type from a functional tag ("removal" does not imply
+  instant/sorcery), and do NOT infer "creature" just because a creature subtype was named --
+  naming the subtype alone (e.g. "dinosaur") is enough, the subtype already narrows the search.
+  Write every entry in "types" in lowercase, singular (e.g. "dinosaur", not "Dinosaurs").
+  If you are not reasonably sure a word names a real Magic type or subtype, do NOT put it in
+  "types" -- leave it in "semantic" instead. A downstream check silently discards anything in
+  "types" that isn't a real type/subtype found in the card database, so under-including here is
+  always safer than guessing wrong.
 - In English noun compounds the LAST noun is the head: "creature destroyer artifact" is an
   ARTIFACT that destroys creatures; "artifact destroyer creature" is a CREATURE that destroys artifacts.
 - "colors": colors the card must have, as letters W U B R G. "colorless": true only if asked.
@@ -413,7 +515,15 @@ _LLM_EXAMPLES = [
     ('"Lightning Bolt"', _ex(name="Lightning Bolt", semantic="")),
     ("the card Sol Ring", _ex(name="Sol Ring", semantic="")),
     ("removal that generates card advantage", _ex(tags=["removal"], semantic="generates card-advantage")),
-    ("dinosaur that costs 7 mana", _ex(cmc_min=7, cmc_max=7, semantic="dinosaur")),
+    # NOTA: este exemplo mudou. Antes o comentario da regra de "types" dizia que filtro de
+    # subtipo nao estava implementado, entao aqui "dinosaur" ficava so no semantic. Agora que
+    # subtipo virou filtro de verdade, deixar o exemplo antigo (sem "dinosaur" em types) ensinaria
+    # o modelo a fazer exatamente o contrario do que a regra nova pede -- por isso troquei este
+    # exemplo em vez de so acrescentar um novo do lado.
+    ("dinosaur that costs 7 mana", _ex(types=["dinosaur"], cmc_min=7, cmc_max=7, semantic="")),
+    # NOVO: dois exemplos para reforcar subtipo-como-filtro e a distincao "propria carta" x "alvo".
+    ("equipment that gives +2/+2", _ex(["equipment"], semantic="gives +2/+2")),
+    ("destroy all dinosaurs", _ex(semantic="destroy all dinosaurs")),
 ]
 
 
@@ -439,8 +549,13 @@ def _as_int(x):
 
 def _validate(data: dict, query: str):
     """Aceita so valores permitidos: o que o LLM inventar fora das listas (ou fora do indice
-    de keywords do corpus) e descartado."""
-    types = [t.lower() for t in data.get("types", []) if isinstance(t, str) and t.lower() in ALLOWED_TYPES]
+    de keywords/tipos do corpus) e descartado."""
+    # NOVO: alem de ALLOWED_TYPES (tipos principais fixos), agora tambem aceita qualquer
+    # subtipo/supertipo que exista de verdade no indice dinamico _TYPE_INDEX (construido por
+    # set_type_index). Sem chamar set_type_index, _TYPE_INDEX fica vazio e o comportamento
+    # e' identico ao de antes (so os tipos de ALLOWED_TYPES passam).
+    types = [t.lower() for t in data.get("types", [])
+             if isinstance(t, str) and (t.lower() in ALLOWED_TYPES or t.lower() in _TYPE_INDEX)]
     colors = [c.upper() for c in data.get("colors", []) if isinstance(c, str) and c.upper() in ALLOWED_COLORS]
     keywords = [_KEYWORD_INDEX[k.lower()] for k in data.get("keywords", [])
                 if isinstance(k, str) and k.lower() in _KEYWORD_INDEX]
@@ -484,6 +599,126 @@ def parse_query_llm(query, client, model="iluma", temperature=0.8, fallback=pars
         return fallback(query)
     _llm_cache[key] = result
     return result
+
+
+# --------------------------------------------- parser por sintaxe (sem LLM, sem IA)
+# Alternativa 100% deterministica a parse_query_llm: em vez de tentar interpretar linguagem
+# natural, o usuario escreve os filtros explicitamente como `prefixo:valor`. Serve de parser
+# principal pra quem quer controle total sem depender de API/IlumA, ou de callback caso a
+# LLM esteja fora do ar.
+#
+# Prefixos suportados (todos aceitam `prefixo:valor`; os numericos tambem aceitam
+# `<=  >=  <  >  =`):
+#   o:palavra   oracle_text contem essa palavra inteira (case-insensitive). Repita o: pra
+#               mais de uma palavra -- todas precisam aparecer (AND). ex.: "o:destroys o:artifact"
+#   t:tipo      tipo OU subtipo/supertipo (creature, artifact, dinosaur, aura, equipment,
+#               legendary...), match de palavra inteira no type_line. Repita t: pra mais de
+#               um tipo (AND). ex.: "t:creature t:dinosaur"
+#   n:(Nome)    nome exato da carta (ou de uma das faces). Precisa de parenteses por causa
+#               dos espacos. ex.: "n:(Lightning Bolt)"
+#   c:wubrg     cores que a carta tem, uma letra por cor sem espaco (precisa ter TODAS as
+#               letras pedidas). c:colorless == sem nenhuma cor. ex.: "c:rg", "c:colorless"
+#   cmc:N / cmc>=N / cmc<=N / cmc>N / cmc<N     custo de mana (mv: e sinonimo de cmc:)
+#   pow:N / tou:N / loy:N / def:N               mesmos operadores, pra
+#               power / toughness / loyalty / defense
+#   k:keyword   keyword de habilidade (Flying, Trample...), match exato contra o indice de
+#               keywords do corpus. Repita k: pra mais de uma (AND).
+#   pm:wubrg    cores de mana que a carta PRODUZ (terrenos/rochas de mana)
+#   tag:tag     tag funcional (removal, ramp...), match exato contra o indice de tags do
+#               corpus. Repita tag: pra mais de uma (AND).
+#   cost:cheap / cost:expensive   mesma preferencia de desempate por custo do parse_query
+#               (nao e' um corte rigido, so' entra no desempate da ordenacao)
+#
+# Qualquer palavra que NAO fizer parte de um token reconhecido vira texto semantico pro
+# embedding, igual nos outros parsers. Valor que nao existir de verdade no corpus (tipo,
+# keyword ou tag desconhecidos) e' descartado silenciosamente, mesma politica do _validate.
+_SYNTAX_KEYS = ("o", "t", "n", "c", "cmc", "mv", "pow", "tou", "loy", "def",
+                "k", "pm", "tag", "cost")
+_SYNTAX_TOKEN = re.compile(
+    r"(?<!\S)(" + "|".join(_SYNTAX_KEYS) + r")(:|<=|>=|=|<|>)(?:\(([^)]*)\)|(\S+))",
+    re.IGNORECASE)
+_SYNTAX_STAT_FIELD = {"cmc": "cmc", "mv": "cmc", "pow": "power", "tou": "toughness",
+                       "loy": "loyalty", "def": "defense"}
+
+
+def _syntax_words(raw):
+    """Divide um valor (bruto, de dentro ou fora de parenteses) em palavras minusculas,
+    sem pontuacao de borda -- usado por o:/t:/k:/tag: quando o valor vem entre parenteses
+    (ex.: "o:(deals damage)" filtra as duas palavras, ambas obrigatorias). Mantem hifen
+    dentro da palavra (varias tags/keywords usam hifen, ex. "card-advantage")."""
+    return [w for w in re.sub(r"[^\w\s-]", " ", raw.lower()).split() if w]
+
+
+def parse_query_syntax(query: str):
+    """Parser por sintaxe explicita (`o:`, `t:`, `n:(...)`, `c:`, `cmc:`, `pow:`, `k:`, `pm:`,
+    `tag:`, `cost:` -- ver comentario acima da lista completa). Devolve (filtros, texto
+    semantico), no mesmo formato de parse_query/parse_query_llm, entao funciona direto como
+    `parser=parse_query_syntax` no hybrid_search."""
+    filters = {"types": [], "colors": [], "colorless": False,
+               "cmc_min": None, "cmc_max": None, "cost_pref": None,
+               "power_min": None, "power_max": None, "toughness_min": None, "toughness_max": None,
+               "loyalty_min": None, "loyalty_max": None, "defense_min": None, "defense_max": None,
+               "keywords": [], "produced_mana": [], "tags": [], "name": None, "oracle_words": []}
+
+    def _apply_stat(field, op, n):
+        if op in (":", "="):
+            filters[f"{field}_min"] = filters[f"{field}_max"] = n
+        elif op == "<=":
+            filters[f"{field}_max"] = n
+        elif op == "<":
+            filters[f"{field}_max"] = n - 1
+        elif op == ">=":
+            filters[f"{field}_min"] = n
+        elif op == ">":
+            filters[f"{field}_min"] = n + 1
+
+    def _token(m):
+        key, op, paren, bare = m.group(1).lower(), m.group(2), m.group(3), m.group(4)
+        valor = paren if paren is not None else (bare or "").strip(".,;")
+
+        if key == "o":
+            for w in _syntax_words(valor):
+                if w not in filters["oracle_words"]:
+                    filters["oracle_words"].append(w)
+        elif key == "t":
+            for w in _syntax_words(valor):
+                canonico = TYPE_WORDS.get(w) or _type_index_lookup(w)
+                if canonico:
+                    c = canonico.lower()
+                    if c not in filters["types"]:
+                        filters["types"].append(c)
+        elif key == "n":
+            filters["name"] = (paren if paren is not None else bare or "").strip()
+        elif key == "c":
+            if valor.lower() == "colorless":
+                filters["colorless"] = True
+            else:
+                for ch in valor.upper():
+                    if ch in ALLOWED_COLORS and ch not in filters["colors"]:
+                        filters["colors"].append(ch)
+        elif key in _SYNTAX_STAT_FIELD and valor.lstrip("-").isdigit():
+            _apply_stat(_SYNTAX_STAT_FIELD[key], op, int(valor))
+        elif key == "k":
+            for w in _syntax_words(valor):
+                canonico = _KEYWORD_INDEX.get(w)
+                if canonico and canonico not in filters["keywords"]:
+                    filters["keywords"].append(canonico)
+        elif key == "pm":
+            for ch in valor.upper():
+                if ch in ALLOWED_COLORS and ch not in filters["produced_mana"]:
+                    filters["produced_mana"].append(ch)
+        elif key == "tag":
+            for w in _syntax_words(valor):
+                canonico = _TAG_INDEX.get(w)
+                if canonico and canonico not in filters["tags"]:
+                    filters["tags"].append(canonico)
+        elif key == "cost" and valor.lower() in ("cheap", "expensive"):
+            filters["cost_pref"] = valor.lower()
+        return " "
+
+    semantic = _SYNTAX_TOKEN.sub(_token, query)
+    semantic = re.sub(r"\s+", " ", semantic).strip(" ,;.")
+    return filters, semantic
 
 
 # ------------------------------------------------------------- busca hibrida
