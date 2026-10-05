@@ -1,20 +1,22 @@
+<img src="./Cabecalho.jpg"/>
+
 # MTG Semantic Searcher
 
-Buscador semântico em linguagem natural para cartas de *Magic: The Gathering*, desenvolvido como projeto final da disciplina de Processamento de Linguagem Natural da [Ilum – Escola de Ciência (CNPEM)](https://ilum.cnpem.br/).
+Buscador semântico em linguagem natural para cartas de *Magic: The Gathering*, desenvolvido como projeto da disciplina de Processamento de Linguagem Natural da [Ilum – Escola de Ciência (CNPEM)](https://ilum.cnpem.br/).
 
 > Em vez de aprender a sintaxe do Scryfall, escreva o que você quer:
-> `green creatures that cost two mana and have flying`, `cards that go wide`, `draw a card when they enter`.
+> `green creatures that cost two mana and have flying`, `cards that go wide`, `sacrifice permanents I control to generate value`.
 
 ---
 
 ## Motivação
 
-*Magic: The Gathering* tem mais de 35 mil cartas, mais de 20 formatos e é Turing-completo. Montar um baralho exige avaliar centenas ou milhares de cartas e suas interações, o que é especialmente difícil para jogadores novos.
+*Magic: The Gathering* tem mais de 35 mil cartas e mais de 20 formatos (agosto de 2026). Montar um baralho exige avaliar centenas ou milhares de cartas e suas interações, o que é especialmente difícil para jogadores novos.
 
 Buscadores como o [Scryfall](https://scryfall.com) e o [Gatherer](https://gatherer.wizards.com) são precisos, mas têm duas limitações:
 
 - **Inteligibilidade:** é preciso aprender uma linguagem de consulta própria antes de fazer buscas úteis.
-- **Criatividade:** a busca é literal, e o jogo tem muitos efeitos diferentes com o mesmo resultado prático (por exemplo, "destroy", "kill" e "when this dies").
+- **Criatividade:** a busca é literal, e o jogo tem muitos efeitos diferentes com o mesmo resultado prático (por exemplo, "sacrifice" é uma mecânica que aparece de diferentes formas: há múltiplas maneiras de sacrificar as suas permanentes em troca de algo).
 
 Este projeto combina **similaridade semântica** (embeddings + similaridade de cossenos) com **filtros estruturados** (cor, tipo, custo de mana etc.) para tornar a busca mais acessível e menos presa à literalidade do texto.
 
@@ -85,7 +87,7 @@ Principais decisões:
 3. **Texto de embedding** de cada carta, em até três blocos: `Oracle Text`, `Keyword Definitions` (definição de cada keyword da carta, com o parâmetro quando existe, como `Cycling {2}`) e `Functions` (otags). Nome, tipo, custo e cores **não** entram no texto, só nos metadados, para que cartas com o mesmo efeito gerem o mesmo texto. Cartas sem texto de efeito recebem o texto `vanilla` (e, em cartas de duas faces, cada face sem texto), então nenhuma carta fica de fora dos embeddings.
 4. **Otags do Scryfall:** `ramp`, `card-advantage` e `removal`, obtidas pela API de busca (`otag:<tag>`) e guardadas em cache.
 5. **Normalização do texto:** símbolos de mana são escritos por extenso e habilidades ativadas `custo: efeito` viram "faça custo para fazer efeito" (`{T}: Add {G}{G}` → *Tap this permanent to add two green mana*).
-6. **Embedding:** [`Qwen/Qwen3-Embedding-0.6B`](https://huggingface.co/Qwen/Qwen3-Embedding-0.6B) (1024 dimensões, `max_seq_length` 1024). A consulta recebe um prefixo de instrução e os documentos não. O modelo usa `padding_side="left"`, tanto na geração dos vetores quanto na busca. Uma primeira versão com `BAAI/bge-small-en-v1.5` foi mantida no repositório como histórico.
+6. **Embedding:** [`Qwen/Qwen3-Embedding-0.6B`](https://huggingface.co/Qwen/Qwen3-Embedding-0.6B) (1024 dimensões, `max_seq_length` 1024). A consulta recebe um prefixo de instrução e os documentos não. O modelo usa `padding_side="left"`, tanto na geração dos vetores quanto na busca. 
 
 ## Estrutura do repositório
 
@@ -94,7 +96,6 @@ Principais decisões:
 | `dicionario_keywords_mtg.ipynb` | **Etapa 1.** Gera `keyword_dictionary.json` a partir das *Comprehensive Rules*. |
 | `documentos_cartas_mtg.ipynb` | **Etapa 1.** Filtra o corpus, busca as otags, monta o texto de embedding e salva `card_documents.jsonl`. |
 | `embeddings_busca_mtg_qwen3.ipynb` | **Etapa 2.** Gera os embeddings com Qwen3, em blocos com checkpoint. Preparado para rodar em GPU/HPC, inclusive offline. |
-| `embeddings_busca_mtg.ipynb` | **Etapa 2 (versão inicial).** Embeddings com `bge-small-en-v1.5`. Usa o campo `embedding_text_structured`, de uma versão anterior dos documentos. |
 | `busca_mtg.ipynb` | **Etapa 3.** Carrega os vetores e define `search`, `search2`, `search3` e `search4`. |
 | `filtros_mtg.py` | Parsers de consulta (regras, LLM e sintaxe), filtros por metadados e `hybrid_search`. |
 
@@ -173,7 +174,7 @@ Os testes foram qualitativos, feitos com pedidos escritos à mão. Eles foram fe
 **O que funcionou bem**
 
 - **Múltiplos filtros em uma só frase:** "*green creatures that cost two mana and have flying*" gerou os 4 filtros corretos (cor, tipo, custo e keyword), reduzindo 33.147 cartas a 28 candidatas.
-- **Busca por nome:** 5 de 6 buscas retornaram a carta certa, inclusive com palavras de enchimento ("*I'm looking for…*") e com cartas de duas faces.
+- **Busca por nome:** buscas retornaram a carta certa, inclusive com palavras de enchimento ("*I'm looking for…*") e com cartas de duas faces. Mas no momento não considera possíveis erros de digitação.
 - **Sinônimos simples:** "*remove lands*" retornou cartas que destroem ou exilam terrenos.
 - **Gatilhos:** "*destroy a land when they enter*" e "*draw a card when they enter*" trouxeram cada uma 5 cartas corretas no top 5.
 - **Estabilidade da API:** mais de 100 buscas em sequência sem *timeout* em condições adequadas.
@@ -194,20 +195,47 @@ Os testes foram qualitativos, feitos com pedidos escritos à mão. Eles foram fe
 - *Fine-tuning* do modelo de embedding com pares consulta em linguagem natural → cartas retornadas pelo Scryfall para a consulta equivalente em sintaxe.
 - Melhorar o prompt e o *parsing* da LLM, com exemplos *few-shot* mais variados.
 - Tolerância a erros de digitação na busca por nome.
-- Avaliação quantitativa da busca e medição dos tempos de resposta.
-- Expansão para português.
 
-## Autores
+# Professor orientador
 
-- Giulio Oertel Spinelli Roux César
-- Joaquim Junior Ferola Fonseca
-- James Moraes de Almeida
+<table>
+  <tr>
+    <td align="center">
+      <a href="https://github.com/jamesmalmeida">
+        <img src="https://avatars.githubusercontent.com/u/108157661?v=4" width="100px;" alt="Foto do James no Github"/><br>
+        <b>Prof. Dr. James Moraes de Almeida</b>
+      </a>
+    </td>
+  </tr>
+</table>
 
-Ilum – Escola de Ciência, Centro Nacional de Pesquisa em Energia e Materiais (CNPEM), Campinas, SP.
+---
+
+# Autores
+
+<table>
+  <tr>
+    <td align="center">
+      <a href="https://github.com/Giulio-Roux">
+        <img src="https://avatars.githubusercontent.com/u/208799014?v=4" width="100px;" alt="Foto do Giulio no Github"/><br>
+        <b>Giulio Oertel Spinelli Roux César</b>
+      </a>
+    </td>
+  </tr>
+</table>
+
+<table>
+  <tr>
+    <td align="center">
+      <a href="https://github.com/JoaquimJFF">
+        <img src="https://avatars.githubusercontent.com/u/208799542?v=4" width="100px;" alt="Foto do Joaquim no Github"/><br>
+        <b>Joaquim Junior Ferola Fonseca</b>
+      </a>
+    </td>
+  </tr>
+</table>
 
 ## Como citar
-
-<!-- TODO: preencher quando o artigo estiver finalizado -->
 
 ```bibtex
 @misc{roux2026mtgsearch,
@@ -222,4 +250,4 @@ Ilum – Escola de Ciência, Centro Nacional de Pesquisa em Energia e Materiais 
 
 Este é um projeto acadêmico e não oficial. *Magic: The Gathering* é marca registrada da Wizards of the Coast LLC. Os dados de cartas vêm da API do [Scryfall](https://scryfall.com), que não é afiliado a este projeto.
 
-<!-- TODO: adicionar licença (arquivo LICENSE) -->
+
