@@ -192,9 +192,9 @@ Os testes foram qualitativos, feitos com pedidos escritos à mão. Eles foram fe
 
 ## Próximos passos
 
-- *Fine-tuning* do modelo de embedding com pares consulta em linguagem natural → cartas retornadas pelo Scryfall para a consulta equivalente em sintaxe.
-- Melhorar o prompt e o *parsing* da LLM, com exemplos *few-shot* mais variados.
-- Tolerância a erros de digitação na busca por nome.
+- *Fine-tuning* do modelo de embedding com pares consulta em linguagem natural → cartas retornadas pelo Scryfall para a consulta equivalente em sintaxe;
+- Interface;
+- Melhorar o *prompt* para a LLM.
 
 # Professor orientador
 
