@@ -53,11 +53,7 @@ _STAT_PATTERN = re.compile(
 _PRODUCES_PATTERN = re.compile(
     r"\bproduces?\s+((?:(?:white|blue|black|red|green)\s*(?:,|and|or)?\s*)+)mana\b", re.IGNORECASE)
 
-# Indice dinamico de keywords: minuscula -> nome canonico (como aparece em card["keywords"]).
-# NAO e' uma lista fixa digitada a mao -- e' construida a partir do corpus de verdade (set_keyword_index),
-# entao cobre exatamente as keywords que existem nos seus dados, com a capitalizacao certa.
-# Multi-palavra (ex.: "first strike") funciona: guardamos o numero de palavras de cada entrada
-# para tentar casar as frases mais longas primeiro ("double strike" antes de so "strike", se existisse).
+# Indice dinamico de keywords
 _KEYWORD_INDEX = {}
 
 
@@ -74,8 +70,7 @@ def set_keyword_index(cards):
     return idx
 
 
-# Indice dinamico de TAGS funcionais (ex.: "removal", "ramp"), no mesmo espirito das keywords:
-# construido a partir do proprio corpus (campo TAG_FIELD), nao digitado a mao.
+# Indice dinamico de TAGS funcionais ("removal", "ramp", "card-advantage")
 _TAG_INDEX = {}
 
 
@@ -92,18 +87,11 @@ def set_tag_index(cards):
 
 
 # =====================================================================================
-# NOVO: indice dinamico de SUPERTIPOS/TIPOS/SUBTIPOS (Legendary, Aura, Dinosaur, Equipment,
-# Rabbit, Vehicle, Saga, Desert, ...), no mesmo espirito de _KEYWORD_INDEX / _TAG_INDEX acima:
-# construido a partir do proprio type_line dos cards, e nao de uma lista digitada a mao.
-# Isso resolve o "nem sempre vai estar escrito Dinosaur": em vez de eu ter que adivinhar/listar
-# cada subtipo que existe em Magic, o indice e' extraido dos dados reais, entao cobre
-# automaticamente qualquer subtipo que exista no seu corpus, com o nome exatamente como o
-# Scryfall escreve (so a CHAVE do dicionario e' minuscula, pra comparar sem depender de
-# maiuscula/minuscula; o VALOR guarda a grafia original, caso um dia voce queira exibir/usar).
+# Indice dinamico de SUPERTIPOS/TIPOS/SUBTIPOS (Legendary, Aura, Dinosaur, Equipment,
+# Rabbit, Vehicle, Saga, Desert, ...), no mesmo espirito de _KEYWORD_INDEX / _TAG_INDEX acima
 #
 # type_line vem tipicamente como "Legendary Enchantment — Aura" ou "Creature — Dinosaur Warrior":
-# a extracao so tira o travessao (em-dash "—", e tambem " - " por seguranca, caso seu dataset
-# use hifen simples) e pega cada palavra que sobra, dos dois lados do travessao.
+# a extracao so tira o travessao (em-dash "—", e tambem " - " por seguranca) e pega cada palavra que sobra.
 # =====================================================================================
 _TYPE_LINE_SPLIT = re.compile(r"\s*(?:—|--|-)\s*")   # em-dash "—", "--" ou " - " entre tipo e subtipo
 _TYPE_INDEX = {}
@@ -135,8 +123,8 @@ def set_metadata_indexes(cards):
 
 
 def set_all_indexes(cards):
-    """NOVO atalho equivalente a set_metadata_indexes, mas tambem chamando set_type_index.
-    Use este no lugar de set_metadata_indexes se quiser habilitar o filtro por
+    """atalho equivalente a set_metadata_indexes, mas tambem chamando set_type_index.
+    Usar este no lugar de set_metadata_indexes se quiser habilitar o filtro por
     subtipo/supertipo (aura, dinosaur, equipment...) junto com keywords e tags."""
     return set_keyword_index(cards), set_tag_index(cards), set_type_index(cards)
 
@@ -174,7 +162,7 @@ def _extract_tags(text):
 
 
 def _type_index_lookup(word):
-    """NOVO: procura `word` (ja' minuscula/sem pontuacao) no indice dinamico de tipos/subtipos.
+    """Procura `word` (ja' minuscula/sem pontuacao) no indice dinamico de tipos/subtipos.
     Tenta a palavra exata e, se nao achar, a forma singular removendo um 's' final
     ("dinosaurs" -> "dinosaur"), ja' que na consulta a palavra pode vir no plural mesmo
     que no type_line ela sempre apareca no singular. Devolve o nome canonico (com a grafia
@@ -266,11 +254,6 @@ def parse_query(query: str):
                 filters["types"].append(TYPE_WORDS[w])
             consumed += 1
             recognized = True
-        # NOVO: subtipos/supertipos dinamicos (aura, dinosaur, equipment, rabbit, saga, ...).
-        # Fica DEPOIS do "elif w in TYPE_WORDS" de proposito: os tipos principais continuam
-        # sendo resolvidos pelo dicionario fixo (com plural ja mapeado); isso so entra em
-        # jogo pra palavras que TYPE_WORDS nao conhece. Guardado em minuscula, porque
-        # `matches()` compara com o type_line ja' com .lower() aplicado.
         elif _type_index_lookup(w) is not None:
             canonico = _type_index_lookup(w).lower()
             if canonico not in filters["types"]:
@@ -548,8 +531,7 @@ def _as_int(x):
 def _validate(data: dict, query: str):
     """Aceita so valores permitidos: o que o LLM inventar fora das listas (ou fora do indice
     de keywords/tipos do corpus) e descartado."""
-    # NOVO: alem de ALLOWED_TYPES (tipos principais fixos), agora tambem aceita qualquer
-    # subtipo/supertipo que exista de verdade no indice dinamico _TYPE_INDEX (construido por
+    # Aceita qualquer subtipo/supertipo que exista de verdade no indice dinamico _TYPE_INDEX (construido por
     # set_type_index). Sem chamar set_type_index, _TYPE_INDEX fica vazio e o comportamento
     # e' identico ao de antes (so os tipos de ALLOWED_TYPES passam).
     types = [t.lower() for t in data.get("types", [])
