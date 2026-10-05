@@ -11,7 +11,6 @@ Regra para nao confundir assunto com alvo:
   (essa mesma regra vale para subtipos: "dinosaur that costs 7 mana" -> filtro: dinosaur;
    "destroy all dinosaurs" -> sem filtro, pois "dinosaurs" aqui e' o ALVO, nao a propria carta)
 """
-import difflib
 import json
 import re
 import numpy as np
@@ -50,6 +49,25 @@ _STAT_PATTERN = re.compile(
     r"\b(power|toughness|loyalty|defense)\s*(<=|>=|=|<|>)?\s*(\d+)"
     r"(?:\s*(or\s+(?:greater|more|higher)|or\s+(?:less|lower)))?\b", re.IGNORECASE)
 
+# Comparacao entre dois stats DA MESMA CARTA (ex.: "toughness greater than power").
+# So reconhece campo-contra-campo; um numero do outro lado continua sendo _STAT_PATTERN.
+_STAT_COMPARE_PATTERN = re.compile(
+    r"\b(power|toughness|loyalty|defense)\s+(?:is\s+)?"
+    r"(greater than or equal to|greater than|higher than|more than|exceeds|"
+    r"less than or equal to|less than|lower than|"
+    r"equal to|the same as|equals)\s+"
+    r"(?:its |their |)?(power|toughness|loyalty|defense)\b", re.IGNORECASE)
+
+_STAT_COMPARE_OPS = {
+    "greater than or equal to": ">=",
+    "greater than": ">", "higher than": ">", "more than": ">", "exceeds": ">",
+    "less than or equal to": "<=",
+    "less than": "<", "lower than": "<",
+    "equal to": "=", "the same as": "=", "equals": "=",
+}
+ALLOWED_STAT_FIELDS = {"power", "toughness", "loyalty", "defense"}
+ALLOWED_STAT_OPS = {">", ">=", "<", "<=", "="}
+
 _PRODUCES_PATTERN = re.compile(
     r"\bproduces?\s+((?:(?:white|blue|black|red|green)\s*(?:,|and|or)?\s*)+)mana\b", re.IGNORECASE)
 
@@ -58,41 +76,48 @@ _PRODUCES_PATTERN = re.compile(
 # entao cobre exatamente as keywords que existem nos seus dados, com a capitalizacao certa.
 # Multi-palavra (ex.: "first strike") funciona: guardamos o numero de palavras de cada entrada
 # para tentar casar as frases mais longas primeiro ("double strike" antes de so "strike", se existisse).
+# _KEYWORD_COUNT guarda a frequencia de cada keyword (usada para montar o vocabulario do prompt da LLM).
 _KEYWORD_INDEX = {}
+_KEYWORD_COUNT = {}
 
 
 def set_keyword_index(cards):
     """Chame uma vez, depois de carregar `cards`, para habilitar o filtro por keyword
     ("flying creature", "creature with first strike and trample").
     Sem chamar isso, filtros de keyword simplesmente nao sao reconhecidos (nao quebra nada)."""
-    global _KEYWORD_INDEX
-    idx = {}
+    global _KEYWORD_INDEX, _KEYWORD_COUNT
+    idx, cnt = {}, {}
     for c in cards:
         for kw in c.get("keywords") or []:
-            idx.setdefault(kw.strip().lower(), kw.strip())
-    _KEYWORD_INDEX = idx
+            k = kw.strip()
+            idx.setdefault(k.lower(), k)
+            cnt[k.lower()] = cnt.get(k.lower(), 0) + 1
+    _KEYWORD_INDEX, _KEYWORD_COUNT = idx, cnt
     return idx
 
 
 # Indice dinamico de TAGS funcionais (ex.: "removal", "ramp"), no mesmo espirito das keywords:
 # construido a partir do proprio corpus (campo TAG_FIELD), nao digitado a mao.
 _TAG_INDEX = {}
+_TAG_COUNT = {}
 
 
 def set_tag_index(cards):
     """Chame uma vez, depois de carregar `cards`, para habilitar o filtro por tag
     ("removal creature", "green ramp"). Sem chamar isso, o filtro simplesmente nao e' reconhecido."""
-    global _TAG_INDEX
-    idx = {}
+    global _TAG_INDEX, _TAG_COUNT
+    idx, cnt = {}, {}
     for c in cards:
         for t in c.get(TAG_FIELD) or []:
-            idx.setdefault(t.strip().lower(), t.strip())
-    _TAG_INDEX = idx
+            k = t.strip()
+            idx.setdefault(k.lower(), k)
+            cnt[k.lower()] = cnt.get(k.lower(), 0) + 1
+    _TAG_INDEX, _TAG_COUNT = idx, cnt
     return idx
 
 
 # =====================================================================================
-# NOVO: indice dinamico de SUPERTIPOS/TIPOS/SUBTIPOS (Legendary, Aura, Dinosaur, Equipment,
+# Indice dinamico de SUPERTIPOS/TIPOS/SUBTIPOS (Legendary, Aura, Dinosaur, Equipment,
 # Rabbit, Vehicle, Saga, Desert, ...), no mesmo espirito de _KEYWORD_INDEX / _TAG_INDEX acima:
 # construido a partir do proprio type_line dos cards, e nao de uma lista digitada a mao.
 # Isso resolve o "nem sempre vai estar escrito Dinosaur": em vez de eu ter que adivinhar/listar
@@ -129,15 +154,9 @@ def set_type_index(cards):
     return idx
 
 
-def set_metadata_indexes(cards):
-    """Atalho: chama set_keyword_index e set_tag_index de una vez."""
-    return set_keyword_index(cards), set_tag_index(cards)
-
-
 def set_all_indexes(cards):
-    """NOVO atalho equivalente a set_metadata_indexes, mas tambem chamando set_type_index.
-    Use este no lugar de set_metadata_indexes se quiser habilitar o filtro por
-    subtipo/supertipo (aura, dinosaur, equipment...) junto com keywords e tags."""
+    """Atalho: chama set_keyword_index, set_tag_index e set_type_index de uma vez, habilitando
+    os filtros por keyword, tag e subtipo/supertipo (aura, dinosaur, equipment...)."""
     return set_keyword_index(cards), set_tag_index(cards), set_type_index(cards)
 
 
@@ -174,7 +193,7 @@ def _extract_tags(text):
 
 
 def _type_index_lookup(word):
-    """NOVO: procura `word` (ja' minuscula/sem pontuacao) no indice dinamico de tipos/subtipos.
+    """Procura `word` (ja' minuscula/sem pontuacao) no indice dinamico de tipos/subtipos.
     Tenta a palavra exata e, se nao achar, a forma singular removendo um 's' final
     ("dinosaurs" -> "dinosaur"), ja' que na consulta a palavra pode vir no plural mesmo
     que no type_line ela sempre apareca no singular. Devolve o nome canonico (com a grafia
@@ -193,7 +212,8 @@ def parse_query(query: str):
                "cmc_min": None, "cmc_max": None, "cost_pref": None,
                "power_min": None, "power_max": None, "toughness_min": None, "toughness_max": None,
                "loyalty_min": None, "loyalty_max": None, "defense_min": None, "defense_max": None,
-               "keywords": [], "produced_mana": [], "tags": [], "name": None}
+               "keywords": [], "produced_mana": [], "tags": [], "name": None,
+               "stat_compare": []}
 
     # 0) nome entre aspas, em qualquer lugar da consulta: "Lightning Bolt"
     m = _NAME_PATTERN.search(query)
@@ -233,6 +253,19 @@ def parse_query(query: str):
         return " "
     rest = _PRODUCES_PATTERN.sub(_produces, rest).strip()
 
+    # 1c-bis) comparacao entre dois stats DA MESMA CARTA: "toughness greater than power".
+    # So funciona campo-contra-campo da propria carta -- comparar com o stat de OUTRA carta
+    # (ex.: "defense higher than any creature's power on the field") nao e' representavel aqui
+    # e continua caindo inteiro em semantic. Roda ANTES de _STAT_PATTERN para nao deixar
+    # "power" ou "toughness" soltos serem mal-interpretados como um stat contra numero.
+    def _stat_compare(m):
+        field_a, phrase, field_b = m.group(1).lower(), m.group(2).lower(), m.group(3).lower()
+        op = _STAT_COMPARE_OPS[phrase]
+        if field_a != field_b:
+            filters["stat_compare"].append((field_a, op, field_b))
+        return " "
+    rest = _STAT_COMPARE_PATTERN.sub(_stat_compare, rest).strip()
+
     # 1d) power/toughness/loyalty/defense: "power >= 3", "toughness 1", "loyalty 5 or greater"
     def _stat(m):
         field, op, n, phrase = m.group(1).lower(), m.group(2), int(m.group(3)), (m.group(4) or "").lower()
@@ -266,7 +299,7 @@ def parse_query(query: str):
                 filters["types"].append(TYPE_WORDS[w])
             consumed += 1
             recognized = True
-        # NOVO: subtipos/supertipos dinamicos (aura, dinosaur, equipment, rabbit, saga, ...).
+        # Subtipos/supertipos dinamicos (aura, dinosaur, equipment, rabbit, saga, ...).
         # Fica DEPOIS do "elif w in TYPE_WORDS" de proposito: os tipos principais continuam
         # sendo resolvidos pelo dicionario fixo (com plural ja mapeado); isso so entra em
         # jogo pra palavras que TYPE_WORDS nao conhece. Guardado em minuscula, porque
@@ -297,7 +330,6 @@ def parse_query(query: str):
         else:
             break
 
-    had_cmc = filters["cmc_min"] is not None or filters["cmc_max"] is not None
     if not recognized:
         consumed = 0                      # nada reconhecido: nao remove palavra nenhuma
     semantic = " ".join(tokens[consumed:])
@@ -424,109 +456,186 @@ def matches(card: dict, f: dict) -> bool:
                 return False
             if hi is not None and val > hi:
                 return False
+    # Comparacao entre dois stats DA MESMA CARTA (ex.: toughness > power). Mesma politica dos
+    # outros stats: se algum dos dois lados nao da' pra confirmar como numero ("*", ausente...),
+    # exclui em vez de arriscar um match errado.
+    for field_a, op, field_b in f.get("stat_compare", []):
+        va, vb = _parse_stat(card.get(field_a)), _parse_stat(card.get(field_b))
+        if va is None or vb is None:
+            return False
+        if op == ">" and not (va > vb):
+            return False
+        if op == ">=" and not (va >= vb):
+            return False
+        if op == "<" and not (va < vb):
+            return False
+        if op == "<=" and not (va <= vb):
+            return False
+        if op == "=" and not (va == vb):
+            return False
     return True
 
 
 # ------------------------------------------------- parser com LLM (IlumA)
-ALLOWED_TYPES = set(TYPE_WORDS.values())
 ALLOWED_COLORS = set("WUBRG")
 
-LLM_SYSTEM = """You convert search queries for Magic: The Gathering cards into JSON.
+LLM_SYSTEM_BASE = """You convert search queries for Magic: The Gathering cards into a JSON filter object.
 
-Return ONLY valid JSON, no markdown fences, with exactly these keys:
+Return ONLY valid JSON (no markdown fences, no explanations) with exactly these keys:
 {"types": [...], "colors": [...], "colorless": false, "cmc_min": null, "cmc_max": null, "cost_pref": null,
  "power_min": null, "power_max": null, "toughness_min": null, "toughness_max": null,
  "loyalty_min": null, "loyalty_max": null, "defense_min": null, "defense_max": null,
- "keywords": [...], "produced_mana": [...], "tags": [...], "name": null, "semantic": "..."}
+ "keywords": [...], "produced_mana": [...], "tags": [...], "name": null,
+ "stat_compare": [...], "semantic": "..."}
 
-Rules:
-- "types": card types AND subtypes/supertypes that the CARD ITSELF has and that the query
-  EXPLICITLY names. This includes: main types (creature, instant, sorcery, artifact, enchantment,
-  land, planeswalker, battle), supertypes (legendary, basic, snow, world), and any subtype
-  (creature types such as dinosaur/zombie/angel/rabbit/vampire; artifact subtypes such as
-  equipment/vehicle/food/clue; enchantment subtypes such as aura/saga/class; land subtypes such
-  as desert/cave/gate; and so on for any other permanent type). A type or subtype that is only the
-  TARGET of the card's effect does NOT go in "types" -- follow the exact same self-vs-target logic
-  for subtypes as for main types: "dinosaur that costs 7 mana" -> types includes "dinosaur"
-  (the card itself is a dinosaur); "destroy all dinosaurs" -> types stays empty and "dinosaurs"
-  stays in "semantic" (here the dinosaurs are what the card affects, not what it is).
-  Include a type/subtype ONLY if that exact word (or its plain singular form) appears literally in
-  the query. Do NOT infer a main type from a functional tag ("removal" does not imply
-  instant/sorcery), and do NOT infer "creature" just because a creature subtype was named --
-  naming the subtype alone (e.g. "dinosaur") is enough, the subtype already narrows the search.
-  Write every entry in "types" in lowercase, singular (e.g. "dinosaur", not "Dinosaurs").
-  If you are not reasonably sure a word names a real Magic type or subtype, do NOT put it in
-  "types" -- leave it in "semantic" instead. A downstream check silently discards anything in
-  "types" that isn't a real type/subtype found in the card database, so under-including here is
-  always safer than guessing wrong.
-- In English noun compounds the LAST noun is the head: "creature destroyer artifact" is an
-  ARTIFACT that destroys creatures; "artifact destroyer creature" is a CREATURE that destroys artifacts.
-- "colors": colors the card must have, as letters W U B R G. "colorless": true only if asked.
-- "cost_pref": "cheap" or "expensive" if the query asks for it, else null. Do NOT turn it into numbers.
-- Only EXPLICIT costs ("cmc <= 3", "mana value 2", "costs zero") go into cmc_min/cmc_max.
-- "power_min/max", "toughness_min/max": from phrases like "power 4 or greater" (power_min=4),
-  "toughness 1 or less" (toughness_max=1), "power exactly 2" (power_min=power_max=2).
-- "loyalty_min/max": for planeswalkers, same pattern as power/toughness.
-- "defense_min/max": for battles, same pattern.
-- "keywords": ability keywords the CARD ITSELF has (e.g. "Flying", "Trample", "First strike",
-  "Indestructible", "Deathtouch", "Lifelink", "Haste", "Vigilance", "Menace", "Reach", "Hexproof",
-  "Ward", "Double strike", "Flash", "Defender"). Use the exact capitalization shown here. A keyword
-  the effect GIVES to something else, or that only appears as reminder text explaining a different
-  ability, does NOT count.
-- "produced_mana": colors a land/mana-rock PRODUCES (e.g. "land that makes green mana" -> ["G"]).
-- "tags": functional category tags for the card (e.g. "removal", "ramp", "card-advantage").
-  Only use a tag if the query is clearly asking for that CATEGORY of card, not describing a specific effect.
-- "name": set ONLY when the query is asking for one SPECIFIC named card (e.g. quoted text, or "the card
-  Lightning Bolt", or just a card name with no description of an effect). Use the name as written. Do NOT
-  set "name" when the query describes what a card does in general terms.
-- "semantic": English phrase describing what the card DOES, without the words used for filters.
-  If the query is ONLY filters (no effect described), use an empty string."""
+GOLDEN RULE: nothing in the query may be lost. Every part of the query must end up either in a
+structured filter or, when no filter can express it, in "semantic". Never drop a phrase silently.
+When a filter captures a phrase, do not repeat that phrase in "semantic". When you are unsure
+whether a filter really captures a phrase, put the phrase in "semantic". "semantic" may be empty
+only when every part of the query was captured by a filter.
+
+FIELDS
+
+- "types": card types, supertypes and subtypes that the CARD ITSELF has and that the query names.
+  Main types: creature, instant, sorcery, artifact, enchantment, land, planeswalker, battle.
+  Supertypes: legendary, basic, snow, world. Subtypes: any creature type (dinosaur, angel, elf...),
+  artifact subtype (equipment, vehicle, food, clue...), enchantment subtype (aura, saga, class...),
+  land subtype (desert, cave, gate...), etc. Write every entry lowercase and singular.
+  A type or subtype that is only the TARGET of the card's effect does NOT go in "types":
+  "dinosaur that costs 7 mana" -> types ["dinosaur"] (the card is a dinosaur);
+  "destroy all dinosaurs" -> types [] and the phrase stays in "semantic" (dinosaurs are the target).
+  Include a type only if that word (or its plain singular) literally appears in the query. Never infer
+  a main type from a tag or effect ("removal" does not imply instant/sorcery), and never add "creature"
+  just because a creature subtype was named. If unsure that a word is a real Magic type, leave it in "semantic".
+  In English noun compounds the LAST noun is the head: "creature destroyer artifact" is an ARTIFACT that
+  destroys creatures.
+- "colors": colors the card must have, letters W U B R G ("blue-black" -> ["U","B"], the card must have both).
+  "colorless": true only if the query asks for colorless cards.
+- "cost_pref": "cheap" or "expensive" if the query asks for it, else null. Never turn it into numbers.
+- Numeric limits ("cmc_*", "power_*", "toughness_*", "loyalty_*", "defense_*") are INCLUSIVE integers:
+  "N or greater"/"at least N" -> min=N; "N or less"/"at most N" -> max=N;
+  "more than N" -> min=N+1; "less than N" -> max=N-1; "exactly N"/"costs N" -> min=max=N.
+  Only EXPLICIT numbers go here ("costs zero" -> 0). Use power/toughness for creatures and vehicles,
+  loyalty for planeswalkers, defense for battles.
+- "stat_compare": list of [field_a, op, field_b] comparing two numeric stats OF THE SAME CARD
+  (fields: "power", "toughness", "loyalty", "defense"; op one of ">", ">=", "<", "<=", "=").
+  "toughness higher than power" -> [["toughness", ">", "power"]]. Use it ONLY when both sides are stats of
+  the card itself. A comparison against a fixed number belongs in the *_min/*_max fields; a comparison against
+  anything else (other cards, the board, life totals, counts of permanents) stays in "semantic".
+- "keywords": abilities or actions the CARD ITSELF has, chosen ONLY from the VALID KEYWORDS list at the end
+  (copy that exact spelling). Match by meaning, not by spelling: the query may use another grammatical form
+  ("discovers" -> "Discover", "proliferates" -> "Proliferate", "flies" -> "Flying", "with first strike" ->
+  "First strike"). A keyword the effect GIVES to other permanents ("creatures you control gain flying") is NOT a
+  keyword of the card: keep that phrase in "semantic". If nothing in the list matches, keep the phrase in "semantic".
+- "tags": functional categories, chosen ONLY from the VALID TAGS list at the end. Use a tag only when the query asks
+  for that CATEGORY of card ("removal", "ramp", "card advantage"), not when it describes one specific effect.
+- "produced_mana": colors a land or mana rock PRODUCES; the card must produce ALL colors listed.
+  Requests such as "two or more colors" or "any color" cannot be expressed here: keep them in "semantic".
+- "name": set ONLY when the query asks for one SPECIFIC named card (quoted text, "the card Sol Ring", or just a card
+  name). Do not set it when the query describes what a card does.
+- "semantic": English phrase describing what the card DOES, without the words already used by filters."""
+
+
+def _vocab_line(index, count, limit):
+    keys = sorted(index, key=lambda k: (-count.get(k, 0), k))[:limit]
+    return ", ".join(sorted(index[k] for k in keys))
+
+
+def build_llm_system():
+    """Prompt base + vocabulario REAL do corpus (keywords/tags), lido dos indices na hora da chamada."""
+    kw = _vocab_line(_KEYWORD_INDEX, _KEYWORD_COUNT, 400) or "(none loaded)"
+    tg = _vocab_line(_TAG_INDEX, _TAG_COUNT, 120) or "(none loaded)"
+    return (LLM_SYSTEM_BASE
+            + "\n\nVALID KEYWORDS: " + kw
+            + "\n\nVALID TAGS: " + tg)
+
 
 def _ex(types=(), colors=(), cmc_min=None, cmc_max=None, cost_pref=None,
        power_min=None, power_max=None, toughness_min=None, toughness_max=None,
        loyalty_min=None, loyalty_max=None, defense_min=None, defense_max=None,
-       keywords=(), produced_mana=(), tags=(), name=None, semantic=""):
-    return {"types": list(types), "colors": list(colors), "colorless": False,
+       keywords=(), produced_mana=(), tags=(), name=None, stat_compare=(),
+       colorless=False, semantic=""):
+    return {"types": list(types), "colors": list(colors), "colorless": colorless,
             "cmc_min": cmc_min, "cmc_max": cmc_max, "cost_pref": cost_pref,
             "power_min": power_min, "power_max": power_max,
             "toughness_min": toughness_min, "toughness_max": toughness_max,
             "loyalty_min": loyalty_min, "loyalty_max": loyalty_max,
             "defense_min": defense_min, "defense_max": defense_max,
             "keywords": list(keywords), "produced_mana": list(produced_mana), "tags": list(tags),
-            "name": name, "semantic": semantic}
+            "name": name, "stat_compare": [list(x) for x in stat_compare], "semantic": semantic}
 
 
 _LLM_EXAMPLES = [
-    ("creature that destroys artifacts", _ex(["creature"], semantic="destroys artifacts")),
-    ("creature destroyer artifact", _ex(["artifact"], semantic="destroys creatures")),
-    ("cheap green creature with flying", _ex(["creature"], ["G"], cost_pref="cheap", semantic="flying")),
+    # --- tipos/subtipos: a propria carta x alvo do efeito ---
+    ("creature that destroys enchantment", _ex(["creature"], semantic="destroys enchantment")),
+    ("artifact destroyer artifact", _ex(["artifact"], semantic="destroys artifacts")),
     ("destroy target creature", _ex(semantic="destroy target creature")),
-    ("cheap green creature", _ex(["creature"], ["G"], cost_pref="cheap", semantic="")),
-    ("instant that counters a spell, costs three mana", _ex(["instant"], cmc_max=3, semantic="counters a spell")),
-    ("creature with power 4 or greater", _ex(["creature"], power_min=4, semantic="")),
-    ("creature with flying and trample", _ex(["creature"], keywords=["Flying", "Trample"], semantic="")),
-    ("indestructible green creature", _ex(["creature"], ["G"], keywords=["Indestructible"], semantic="")),
-    ("land that produces green mana", _ex(["land"], produced_mana=["G"], semantic="")),
+    ("destroy all dinosaurs", _ex(semantic="destroy all dinosaurs")),
+    ("dinosaur that costs 7 mana", _ex(["dinosaur"], cmc_min=7, cmc_max=7)),
+    ("equipment that gives +2/+2", _ex(["equipment"], semantic="gives +2/+2")),
+    ("saga that draws cards", _ex(["saga"], semantic="draws cards")),
+    ("indestructible green enchantment", _ex(["enchantment"], ["G"], keywords=["Indestructible"])),
+
+    # --- cores ---
+    ("blue-black instant that counters spells", _ex(["instant"], ["U", "B"], semantic="counters spells")),
+    ("colorless artifact", _ex(["artifact"], colorless=True)),
+
+    # --- custo ---
+    ("instant that counters a spell and costs three mana or less",
+     _ex(["instant"], cmc_max=3, semantic="counters a spell")),
+    ("artifact that costs more than 4 mana", _ex(["artifact"], cmc_min=5)),
+
+    # --- stats numericos contra constante ---
+    ("vehicle with power 4 or greater", _ex(["vehicle"], power_min=4)),
+    ("vehicle with power 1 or less", _ex(["vehicle"], power_max=1)),
+    ("creature with toughness 5 or greater", _ex(["creature"], toughness_min=5)),
+    ("creature with toughness 1 or less that has flying",
+     _ex(["creature"], toughness_max=1, keywords=["Flying"])),
     ("planeswalker with loyalty 6 or higher that draws cards",
      _ex(["planeswalker"], loyalty_min=6, semantic="draws cards")),
-    ("cheap green removal", _ex(["instant", "sorcery"], ["G"], cost_pref="cheap", tags=["removal"], semantic="")),
-    ('"Lightning Bolt"', _ex(name="Lightning Bolt", semantic="")),
-    ("the card Sol Ring", _ex(name="Sol Ring", semantic="")),
-    ("removal that generates card advantage", _ex(tags=["removal"], semantic="generates card-advantage")),
-    # NOTA: este exemplo mudou. Antes o comentario da regra de "types" dizia que filtro de
-    # subtipo nao estava implementado, entao aqui "dinosaur" ficava so no semantic. Agora que
-    # subtipo virou filtro de verdade, deixar o exemplo antigo (sem "dinosaur" em types) ensinaria
-    # o modelo a fazer exatamente o contrario do que a regra nova pede -- por isso troquei este
-    # exemplo em vez de so acrescentar um novo do lado.
-    ("dinosaur that costs 7 mana", _ex(types=["dinosaur"], cmc_min=7, cmc_max=7, semantic="")),
-    # NOVO: dois exemplos para reforcar subtipo-como-filtro e a distincao "propria carta" x "alvo".
-    ("equipment that gives +2/+2", _ex(["equipment"], semantic="gives +2/+2")),
-    ("destroy all dinosaurs", _ex(semantic="destroy all dinosaurs")),
+    ("planeswalker with loyalty 3 or lower", _ex(["planeswalker"], loyalty_max=3)),
+    ("battle with defense 3 or less", _ex(["battle"], defense_max=3)),
+    ("battle with defense 5 or greater that deals damage",
+     _ex(["battle"], defense_min=5, semantic="deals damage")),
+
+    # --- comparacao entre dois stats DA MESMA CARTA ---
+    ("creature with toughness greater than power",
+     _ex(["creature"], stat_compare=[("toughness", ">", "power")])),
+    ("vehicle whose power is equal to its toughness",
+     _ex(["vehicle"], stat_compare=[("power", "=", "toughness")])),
+    ("angel that scries, with toughness higher than power",
+     _ex(["angel"], keywords=["Scry"], stat_compare=[("toughness", ">", "power")])),
+    # comparacao com algo que NAO e' stat da propria carta: nao ha filtro -> semantic
+    ("battle with defense higher than any creature's power on the field",
+     _ex(["battle"], semantic="defense higher than any creature's power on the field")),
+
+    # --- keywords (inclusive formas verbais; keyword DADA a outros vai pra semantic) ---
+    ("cheap green creature with flying", _ex(["creature"], ["G"], cost_pref="cheap", keywords=["Flying"])),
+    ("permanent with flying and trample", _ex(keywords=["Flying", "Trample"])),
+    ("artifact that proliferates", _ex(["artifact"], keywords=["Proliferate"])),
+    ("elf that investigates and draws a card",
+     _ex(["elf"], keywords=["Investigate"], semantic="draws a card")),
+    ("gives creatures you control flying", _ex(semantic="gives creatures you control flying")),
+
+    # --- produced_mana (a carta precisa produzir TODAS as cores listadas) ---
+    ("land that produces green mana", _ex(["land"], produced_mana=["G"])),
+    ("land that produces two or more colors of mana",
+     _ex(["land"], semantic="produces two or more colors of mana")),
+
+    # --- tags (sem assumir tipo) ---
+    ("cheap green removal", _ex([], ["G"], cost_pref="cheap", tags=["removal"])),
+    ("removal that generates card advantage", _ex(tags=["removal", "card-advantage"])),
+    ("ramp that fixes colors", _ex(tags=["ramp"], semantic="fixes colors")),
+    ("card advantage that costs two mana or less", _ex(cmc_max=2, tags=["card-advantage"])),
+
+    # --- nome ---
+    ('"Lightning Bolt"', _ex(name="Lightning Bolt")),
+    ("the card Sol Ring", _ex(name="Sol Ring")),
 ]
 
 
 def _llm_messages(query):
-    msgs = [{"role": "system", "content": LLM_SYSTEM}]
+    msgs = [{"role": "system", "content": build_llm_system()}]
     for q, answer in _LLM_EXAMPLES:                      # few-shot: pares user/assistant escritos por nos
         msgs.append({"role": "user", "content": q})
         msgs.append({"role": "assistant", "content": json.dumps(answer)})
@@ -535,61 +644,184 @@ def _llm_messages(query):
 
 
 def _strip_fences(text: str) -> str:
-    t = text.strip()
+    t = re.sub(r"<think>.*?</think>", "", text.strip(), flags=re.DOTALL).strip()  # modelos com raciocinio
     if t.startswith("```"):
-        t = re.sub(r"^```(?:json)?\s*|\s*```$", "", t)
+        t = re.sub(r"^```(?:json)?\s*|\s*```$", "", t).strip()
+    i, j = t.find("{"), t.rfind("}")
+    if i != -1 and j > i:                      # texto antes/depois do JSON
+        t = t[i:j + 1]
     return t
 
 
 def _as_int(x):
-    return x if isinstance(x, int) and not isinstance(x, bool) else None
+    if isinstance(x, bool):
+        return None
+    if isinstance(x, int):
+        return x
+    if isinstance(x, float) and x.is_integer():
+        return int(x)
+    if isinstance(x, str) and x.strip().lstrip("-").isdigit():   # "4" -> 4
+        return int(x.strip())
+    return None
 
 
-def _validate(data: dict, query: str):
-    """Aceita so valores permitidos: o que o LLM inventar fora das listas (ou fora do indice
-    de keywords/tipos do corpus) e descartado."""
-    # NOVO: alem de ALLOWED_TYPES (tipos principais fixos), agora tambem aceita qualquer
-    # subtipo/supertipo que exista de verdade no indice dinamico _TYPE_INDEX (construido por
-    # set_type_index). Sem chamar set_type_index, _TYPE_INDEX fica vazio e o comportamento
-    # e' identico ao de antes (so os tipos de ALLOWED_TYPES passam).
-    types = [t.lower() for t in data.get("types", [])
-             if isinstance(t, str) and (t.lower() in ALLOWED_TYPES or t.lower() in _TYPE_INDEX)]
-    colors = [c.upper() for c in data.get("colors", []) if isinstance(c, str) and c.upper() in ALLOWED_COLORS]
-    keywords = [_KEYWORD_INDEX[k.lower()] for k in data.get("keywords", [])
-                if isinstance(k, str) and k.lower() in _KEYWORD_INDEX]
-    produced = [c.upper() for c in data.get("produced_mana", []) if isinstance(c, str) and c.upper() in ALLOWED_COLORS]
-    tags = [_TAG_INDEX[t.lower()] for t in data.get("tags", []) if isinstance(t, str) and t.lower() in _TAG_INDEX]
+def _valid_stat_compare(entry):
+    """Aceita so [field_a, op, field_b] bem formado, com os dois campos entre os quatro
+    stats conhecidos, op entre os cinco operadores permitidos, e field_a != field_b
+    (comparar um stat com ele mesmo nao tem sentido)."""
+    if not (isinstance(entry, (list, tuple)) and len(entry) == 3):
+        return None
+    a, op, b = entry
+    if not (isinstance(a, str) and isinstance(op, str) and isinstance(b, str)):
+        return None
+    a, b = a.lower(), b.lower()
+    if a in ALLOWED_STAT_FIELDS and b in ALLOWED_STAT_FIELDS and op in ALLOWED_STAT_OPS and a != b:
+        return (a, op, b)
+    return None
+
+
+def _lookup_inflected(word, index):
+    """Procura `word` no indice tolerando plural/flexao verbal
+    ("discovers" -> "discover", "scries" -> "scry", "proliferating" -> "proliferate")."""
+    w = word.strip().lower()
+    if not w:
+        return None
+    cands = [w]
+    if w.endswith("ies"):
+        cands.append(w[:-3] + "y")
+    if w.endswith("es"):
+        cands.append(w[:-2])
+    if w.endswith("s"):
+        cands.append(w[:-1])
+    if w.endswith("ed"):
+        cands += [w[:-2], w[:-1]]
+    if w.endswith("ing"):
+        cands += [w[:-3], w[:-3] + "e"]
+    for c in cands:
+        if c in index:
+            return index[c]
+    return None
+
+
+_NUM_KEYS = ("cmc_min", "cmc_max", "power_min", "power_max", "toughness_min", "toughness_max",
+             "loyalty_min", "loyalty_max", "defense_min", "defense_max")
+
+
+def _validate(data: dict, report=None):
+    """Aceita so valores validos, mas NUNCA perde informacao em silencio:
+    - tudo que for descartado e' anotado em `report` (lista de strings, p/ debug);
+    - tipo/keyword/tag que nao validou volta para o texto semantico, entao o embedding ainda o ve."""
+    if report is None:
+        report = []
+    leftovers = []
+
+    def _list(key):
+        v = data.get(key)
+        return v if isinstance(v, list) else []
+
+    types = []
+    for t in _list("types"):
+        if not isinstance(t, str):
+            continue
+        tl = t.strip().lower()
+        canon = TYPE_WORDS.get(tl) or (_type_index_lookup(tl) or "").lower() or None
+        if canon:
+            types.append(canon)
+        else:
+            report.append(f"types: {t!r} nao existe no corpus (indice de tipos tem {len(_TYPE_INDEX)} entradas)")
+            leftovers.append(tl)
+
+    colors = []
+    for c in _list("colors"):
+        if isinstance(c, str) and c.upper() in ALLOWED_COLORS:
+            colors.append(c.upper())
+        else:
+            report.append(f"colors: {c!r} invalida")
+
+    produced = []
+    for c in _list("produced_mana"):
+        if isinstance(c, str) and c.upper() in ALLOWED_COLORS:
+            produced.append(c.upper())
+        else:
+            report.append(f"produced_mana: {c!r} invalida")
+
+    keywords = []
+    for k in _list("keywords"):
+        canon = _lookup_inflected(k, _KEYWORD_INDEX) if isinstance(k, str) else None
+        if canon:
+            keywords.append(canon)
+        else:
+            report.append(f"keywords: {k!r} nao esta no indice (indice tem {len(_KEYWORD_INDEX)} entradas)")
+            if isinstance(k, str):
+                leftovers.append(k)
+
+    tags = []
+    for t in _list("tags"):
+        canon = _lookup_inflected(t, _TAG_INDEX) if isinstance(t, str) else None
+        if canon:
+            tags.append(canon)
+        else:
+            report.append(f"tags: {t!r} nao esta no indice (indice tem {len(_TAG_INDEX)} entradas)")
+            if isinstance(t, str):
+                leftovers.append(t)
+
+    stat_compare = []
+    for e in _list("stat_compare"):
+        sc = _valid_stat_compare(e)
+        if sc:
+            stat_compare.append(sc)
+        else:
+            report.append(f"stat_compare: entrada invalida {e!r}")
+
+    nums = {}
+    for k in _NUM_KEYS:
+        raw = data.get(k)
+        nums[k] = _as_int(raw)
+        if raw is not None and nums[k] is None:
+            report.append(f"{k}: valor nao numerico {raw!r}")
+
     name = data.get("name")
     name = name.strip() if isinstance(name, str) and name.strip() else None
     semantic = data.get("semantic")
-    if not isinstance(semantic, str):
-        semantic = ""
+    semantic = semantic.strip() if isinstance(semantic, str) else ""
+    semantic = " ".join([semantic] + leftovers).strip()
+
+    cost_pref = data.get("cost_pref")
     filters = {"types": list(dict.fromkeys(types)), "colors": list(dict.fromkeys(colors)),
                "colorless": data.get("colorless") is True,
-               "cmc_min": _as_int(data.get("cmc_min")), "cmc_max": _as_int(data.get("cmc_max")),
-               "cost_pref": data.get("cost_pref") if data.get("cost_pref") in ("cheap", "expensive") else None,
-               "power_min": _as_int(data.get("power_min")), "power_max": _as_int(data.get("power_max")),
-               "toughness_min": _as_int(data.get("toughness_min")), "toughness_max": _as_int(data.get("toughness_max")),
-               "loyalty_min": _as_int(data.get("loyalty_min")), "loyalty_max": _as_int(data.get("loyalty_max")),
-               "defense_min": _as_int(data.get("defense_min")), "defense_max": _as_int(data.get("defense_max")),
+               "cost_pref": cost_pref if cost_pref in ("cheap", "expensive") else None,
                "keywords": list(dict.fromkeys(keywords)), "produced_mana": list(dict.fromkeys(produced)),
-               "tags": list(dict.fromkeys(tags)), "name": name}
-    return filters, semantic.strip()
+               "tags": list(dict.fromkeys(tags)), "name": name,
+               "stat_compare": list(dict.fromkeys(stat_compare)), **nums}
+    return filters, semantic
 
 
 _llm_cache = {}
 
 
-def parse_query_llm(query, client, model="iluma", temperature=0.8, fallback=parse_query):
+def parse_query_llm(query, client, model="iluma", temperature=0.5, fallback=parse_query,
+                    debug=False, use_cache=True):
     """Interpreta a consulta com o LLM. Se falhar (timeout, JSON ruim...), usa o parser de regras.
-    temperature=0.5: abaixo disso a IlumA trava (ver material da aula)."""
+    temperature=0.5: abaixo disso a IlumA trava (ver material da aula).
+    debug=True: mostra o JSON BRUTO da IlumA e tudo que o _validate descartou/moveu pro semantic.
+    use_cache=False: ignora _llm_cache (util ao testar mudancas no prompt)."""
     key = query.strip().lower()
-    if key in _llm_cache:                                # mesma consulta = nao gasta cota de novo
+    if use_cache and key in _llm_cache:                  # mesma consulta = nao gasta cota de novo
+        if debug:
+            print("(resultado vindo do cache; use use_cache=False ou _llm_cache.clear())")
         return _llm_cache[key]
     try:
         r = client.chat.completions.create(model=model, messages=_llm_messages(query),
                                            temperature=temperature)
-        result = _validate(json.loads(_strip_fences(r.choices[0].message.content)), query)
+        raw = r.choices[0].message.content
+        report = []
+        result = _validate(json.loads(_strip_fences(raw)), report)
+        if debug:
+            print("LLM bruto:", raw.strip())
+            for line in report:
+                print("  descartado/ajustado ->", line)
+            if not report:
+                print("  (nada descartado no _validate)")
     except Exception as e:                               # nao cacheia falhas: podem ser passageiras
         import traceback
         traceback.print_exc()          # <- mostra o stack completo, com a linha exata que estourou
@@ -619,6 +851,9 @@ def parse_query_llm(query, client, model="iluma", temperature=0.8, fallback=pars
 #   cmc:N / cmc>=N / cmc<=N / cmc>N / cmc<N     custo de mana (mv: e sinonimo de cmc:)
 #   pow:N / tou:N / loy:N / def:N               mesmos operadores, pra
 #               power / toughness / loyalty / defense
+#   cmp:campoAopcampoB   comparacao entre dois stats DA MESMA CARTA (ex.: "cmp:tou>pow" ==
+#               toughness maior que power). Operadores: > >= < <= =. Campos aceitos: power,
+#               toughness, loyalty, defense (ou as abreviacoes pow/tou/loy/def).
 #   k:keyword   keyword de habilidade (Flying, Trample...), match exato contra o indice de
 #               keywords do corpus. Repita k: pra mais de uma (AND).
 #   pm:wubrg    cores de mana que a carta PRODUZ (terrenos/rochas de mana)
@@ -631,12 +866,17 @@ def parse_query_llm(query, client, model="iluma", temperature=0.8, fallback=pars
 # embedding, igual nos outros parsers. Valor que nao existir de verdade no corpus (tipo,
 # keyword ou tag desconhecidos) e' descartado silenciosamente, mesma politica do _validate.
 _SYNTAX_KEYS = ("o", "t", "n", "c", "cmc", "mv", "pow", "tou", "loy", "def",
-                "k", "pm", "tag", "cost")
+                "cmp", "k", "pm", "tag", "cost")
 _SYNTAX_TOKEN = re.compile(
     r"(?<!\S)(" + "|".join(_SYNTAX_KEYS) + r")(:|<=|>=|=|<|>)(?:\(([^)]*)\)|(\S+))",
     re.IGNORECASE)
 _SYNTAX_STAT_FIELD = {"cmc": "cmc", "mv": "cmc", "pow": "power", "tou": "toughness",
                        "loy": "loyalty", "def": "defense"}
+_STAT_ABBR = {"pow": "power", "tou": "toughness", "loy": "loyalty", "def": "defense",
+              "power": "power", "toughness": "toughness", "loyalty": "loyalty", "defense": "defense"}
+_CMP_VALUE = re.compile(
+    r"\s*(power|toughness|loyalty|defense|pow|tou|loy|def)\s*(>=|<=|>|<|=)\s*"
+    r"(power|toughness|loyalty|defense|pow|tou|loy|def)\s*$", re.IGNORECASE)
 
 
 def _syntax_words(raw):
@@ -648,15 +888,16 @@ def _syntax_words(raw):
 
 
 def parse_query_syntax(query: str):
-    """Parser por sintaxe explicita (`o:`, `t:`, `n:(...)`, `c:`, `cmc:`, `pow:`, `k:`, `pm:`,
-    `tag:`, `cost:` -- ver comentario acima da lista completa). Devolve (filtros, texto
+    """Parser por sintaxe explicita (`o:`, `t:`, `n:(...)`, `c:`, `cmc:`, `pow:`, `cmp:`, `k:`,
+    `pm:`, `tag:`, `cost:` -- ver comentario acima da lista completa). Devolve (filtros, texto
     semantico), no mesmo formato de parse_query/parse_query_llm, entao funciona direto como
     `parser=parse_query_syntax` no hybrid_search."""
     filters = {"types": [], "colors": [], "colorless": False,
                "cmc_min": None, "cmc_max": None, "cost_pref": None,
                "power_min": None, "power_max": None, "toughness_min": None, "toughness_max": None,
                "loyalty_min": None, "loyalty_max": None, "defense_min": None, "defense_max": None,
-               "keywords": [], "produced_mana": [], "tags": [], "name": None, "oracle_words": []}
+               "keywords": [], "produced_mana": [], "tags": [], "name": None, "oracle_words": [],
+               "stat_compare": []}
 
     def _apply_stat(field, op, n):
         if op in (":", "="):
@@ -696,6 +937,15 @@ def parse_query_syntax(query: str):
                         filters["colors"].append(ch)
         elif key in _SYNTAX_STAT_FIELD and valor.lstrip("-").isdigit():
             _apply_stat(_SYNTAX_STAT_FIELD[key], op, int(valor))
+        elif key == "cmp":
+            # sintaxe: cmp:tou>pow  (o operador fica DENTRO do valor, depois do ':')
+            mc = _CMP_VALUE.match(valor)
+            if mc:
+                field_a = _STAT_ABBR[mc.group(1).lower()]
+                cmp_op = mc.group(2)
+                field_b = _STAT_ABBR[mc.group(3).lower()]
+                if field_a != field_b:
+                    filters["stat_compare"].append((field_a, cmp_op, field_b))
         elif key == "k":
             for w in _syntax_words(valor):
                 canonico = _KEYWORD_INDEX.get(w)
@@ -734,38 +984,6 @@ def _name_rank(card: dict, query_name: str):
     return best
 
 
-def find_card(cards, query, k=5, fuzzy_threshold=0.6):
-    """Busca RAPIDA por nome (sem embedding, sem IlumA) -- para achar UMA carta especifica,
-    inclusive com erro de digitacao ou nome parcial. Prioridade:
-    1) nome exato (case-insensitive)  2) comeca com a consulta  3) consulta e' substring do nome
-    4) parecido o suficiente (difflib), quando nada exato/prefixo/substring foi encontrado.
-    Devolve ate k cartas (dicts originais de `cards`), da melhor pra pior."""
-    q = query.strip().lower()
-    if not q:
-        return []
-    exact, prefix, substring = [], [], []
-    for c in cards:
-        for p in _name_parts(c):
-            pl = p.lower()
-            if pl == q:
-                exact.append(c); break
-            elif pl.startswith(q):
-                prefix.append(c); break
-            elif q in pl:
-                substring.append(c); break
-    ordered = exact + prefix + substring
-    if ordered:
-        return ordered[:k]
-    # nada bateu por substring: tenta por semelhanca (tolera erro de digitacao)
-    scored = []
-    for c in cards:
-        ratio = max(difflib.SequenceMatcher(None, q, p.lower()).ratio() for p in _name_parts(c))
-        if ratio >= fuzzy_threshold:
-            scored.append((ratio, c))
-    scored.sort(key=lambda x: -x[0])
-    return [c for _, c in scored[:k]]
-
-
 def _z(x):
     """Padroniza (media 0, desvio 1) para poder somar relevancia e custo na mesma escala."""
     sd = x.std()
@@ -773,14 +991,15 @@ def _z(x):
 
 
 def hybrid_search(query, model, embeddings, cards, query_prefix, k=10, verbose=True, parser=parse_query,
-                  embed_full_query=True, alpha_if_no_semantic=False):
+                  embed_full_query=False, alpha_if_no_semantic=False):
     """cards: lista de dicts ALINHADA com as linhas de `embeddings` (mesma ordem).
     Com "cheap"/"expensive" na consulta, o campo 'score' vira uma nota combinada
     (relevancia + custo); a similaridade pura fica em 'sim'.
     Consulta so de filtros + cheap/expensive (ex.: "cheap green creature"): nao ha relevancia
     a preservar, entao ordena direto por custo (desempate pela similaridade).
-    embed_full_query=True (padrao): embeda a consulta INTEIRA, mesmo depois de tirar os filtros;
-    False: embeda so o texto que sobrou (ex.: 'destroys artifacts').
+    embed_full_query=False (padrao): embeda so o texto que sobrou depois de tirar os filtros
+    (ex.: 'destroys artifacts'; se nao sobrou nada, embeda a consulta inteira);
+    True: embeda a consulta INTEIRA, mesmo depois de tirar os filtros.
     alpha_if_no_semantic=False (padrao): se True e a consulta for SO filtro (nada sobrou de
     texto semantico e sem preferencia cheap/expensive), pula o modelo de embedding de vez e
     devolve os resultados em ordem alfabetica pelo nome -- nao ha "relevancia" a calcular
